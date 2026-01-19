@@ -253,7 +253,10 @@ def handle_client(client_socket, address):
                         sock.sendall(packet)
                     except:
                         pass
-        
+                        
+        mpacket = struct.pack('>BB', 0x0d, 0xff)
+        mpacket += pad_string(f"&e{player_name} has joined the game")
+        broadcast(mpacket)
         print(f"[SPAWN] {player_name} joined (ID: {player_id})")
         
         # === MAIN GAME LOOP ===
@@ -310,7 +313,7 @@ def handle_client(client_socket, address):
                         # Broadcast to all
                         # [0x0d][player_id:byte][message*64]
                         packet = struct.pack('>BB', 0x0d, 0xff)  # 0xff = system message
-                        packet += pad_string(f"<{player_name}> {message}")
+                        packet += pad_string(f"&f<{player_name}> {message}")
                         broadcast(packet)
             
             else:
@@ -331,6 +334,9 @@ def handle_client(client_socket, address):
         if player_id >= 0:
             packet = struct.pack('>Bb', 0x0c, player_id)
             broadcast(packet)
+            mpacket = struct.pack('>BB', 0x0d, 0xff)
+            mpacket += pad_string(f"&e{player_name} has left the game")
+            broadcast(mpacket)
             print(f"[LEAVE] {player_name} left the game")
         
         try:
