@@ -1,59 +1,194 @@
-import socket
-import struct
-import gzip
-import io
-import os
-import lzma
-import threading
-import time
+import socket, struct, gzip, io, os, threading, time, numpy as np
+import requests, json, random, string, hashlib
+from pyngrok import ngrok
+import ujson as json
+
 
 # World configuration
-X, Y, Z = 128, 64, 128
-world_data = bytearray(X * Y * Z)
+X, Y, Z = 2560, 128, 2560
 clients = {}
 clients_lock = threading.Lock()
 next_player_id = 0
+admin_list = ["TheMrRedSlime"]
+USER_DB_FILE = "users.json"
+player_list = set()
+authenticated_clients = set()
+
+# LOG-BASED SYSTEM: Stores (index, block_type) to avoid 2GB RAM usage
+block_logs = {} 
+logs_lock = threading.Lock()
+
+def hash_password(password):
+    return hashlib.sha512(password.encode()).hexdigest()
+
+def load_users():
+    if os.path.exists(USER_DB_FILE):
+        with open(USER_DB_FILE, 'r') as f: return json.load(f)
+    return {}
+
+def save_user(username, password_hash):
+    users = load_users()
+    users[username.lower()] = password_hash
+    with open(USER_DB_FILE, 'w') as f: json.dump(users, f)
 
 def pad_string(s):
-    """Pad string to 64 bytes"""
     return s[:64].ljust(64).encode('ascii')
 
-def recv_exact(sock, n):
-    """Receive exactly n bytes or raise exception"""
+def recv_exact(sock, n, max_size=1024):
+    if n > max_size:
+        raise ValueError(f"Security Trigger: Packet size {n} exceeds limit {max_size}")
+        
     data = b''
     while len(data) < n:
         chunk = sock.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError("Connection closed")
+        if not chunk: raise ConnectionError("Closed")
         data += chunk
     return data
-
-def save_world():
-    """Save world to disk"""
-    try:
-        with lzma.open("world.dat", "wb", preset=9 | lzma.PRESET_EXTREME) as f:
-            f.write(world_data)
-        print("[SERVER] World saved")
-    except Exception as e:
-        print(f"[ERROR] Failed to save world: {e}")
-
-def broadcast(packet, exclude_socket=None):
-    """Send packet to all connected clients"""
-    with clients_lock:
-        dead_sockets = []
-        for sock, (name, pid) in list(clients.items()):
-            if sock != exclude_socket:
-                try:
-                    sock.sendall(packet)
-                except:
-                    dead_sockets.append(sock)
+    
+def generate_initial_rle():
+    """Creates a new world.rle with half grass if none exists."""
+    if os.path.exists("world.rle"): return
+    print("[SERVER] Generating initial RLE world (Half Grass)...")
+    half = (X * Y * Z) // 2
+    with open("world.rle", "wb") as f:
+        # Write in chunks to avoid memory issues
+        chunk_size = 10000000  # 10M blocks at a time
+        remaining_grass = half
         
-        # Clean up dead connections
-        for sock in dead_sockets:
-            if sock in clients:
-                name, pid = clients[sock]
-                del clients[sock]
-                print(f"[SERVER] Cleaned up dead connection: {name}")
+        while remaining_grass > 0:
+            count = min(255, remaining_grass)
+            f.write(bytes([count, 2]))  # Grass
+            remaining_grass -= count
+        
+        remaining_air = (X * Y * Z) - half
+        while remaining_air > 0:
+            count = min(255, remaining_air)
+            f.write(bytes([count, 0]))  # Air
+            remaining_air -= count
+    
+    print("[SERVER] RLE world generated!")
+
+def auto_save_task():
+    while True:
+        time.sleep(300) 
+        if not block_logs: continue
+        
+        print(f"[SERVER] Fast-saving {len(block_logs)} changes in 50MB chunks...")
+        try:
+            with logs_lock:
+                changes_copy = dict(block_logs)
+            
+            CHUNK_SIZE = 50_000_000 
+            new_rle_path = "world.rle.tmp"
+            
+            with open("world.rle", "rb") as f_in, open(new_rle_path, "wb") as f_out:
+                # Read all existing RLE metadata at once (this is small)
+                rle_data = f_in.read()
+                counts = np.frombuffer(rle_data[0::2], dtype=np.uint8)
+                vals = np.frombuffer(rle_data[1::2], dtype=np.uint8)
+                
+                # Reconstruct only the indices we need to find chunk boundaries
+                # Note: We don't reconstruct the world, just the "cumulative" counts
+                cum_counts = np.cumsum(counts, dtype=np.int64)
+                
+                for start in range(0, X*Y*Z, CHUNK_SIZE):
+                    end = min(start + CHUNK_SIZE, X*Y*Z)
+                    
+                    # Find which RLE pairs belong to this 100MB chunk
+                    # This is the "secret sauce" for speed
+                    idx_start = np.searchsorted(cum_counts, start, side='right')
+                    idx_end = np.searchsorted(cum_counts, end, side='left')
+                    
+                    # Materialize just THIS 100MB chunk
+                    chunk_counts = counts[idx_start:idx_end+1].copy()
+                    chunk_vals = vals[idx_start:idx_end+1].copy()
+                    
+                    # Adjust the first and last run if they overlap chunk boundaries
+                    chunk_counts[0] = cum_counts[idx_start] - start
+                    chunk_counts[-1] = end - (cum_counts[idx_end-1] if idx_end > 0 else 0)
+                    
+                    # Expand, patch, and re-compress the chunk using NumPy
+                    temp_chunk = np.repeat(chunk_vals, chunk_counts)
+                    
+                    # Patch logs
+                    for idx in list(changes_copy.keys()):
+                        if start <= idx < end:
+                            temp_chunk[idx - start] = changes_copy.pop(idx)
+                    
+                    # Fast RLE compression for the chunk
+                    if len(temp_chunk) > 0:
+                        diffs = np.concatenate(([True], temp_chunk[1:] != temp_chunk[:-1]))
+                        points = np.where(diffs)[0]
+                        run_vals = temp_chunk[points]
+                        run_lens = np.diff(np.append(points, len(temp_chunk)))
+                        
+                        for c, v in zip(run_lens, run_vals):
+                            while c > 255:
+                                f_out.write(bytes([255, int(v)]))
+                                c -= 255
+                            f_out.write(bytes([int(c), int(v)]))
+
+            os.replace(new_rle_path, "world.rle")
+            with logs_lock:
+                for key in (set(block_logs.keys()) - set(changes_copy.keys())):
+                    block_logs.pop(key, None)
+            print("[SERVER] Fast-save complete.")
+        except Exception as e:
+            print(f"[ERROR] Save failed: {e}")
+
+def handle_command(player_name: str, message: str, client_socket):
+    args = message.split()
+    command = args[0].lower()
+    if command == "/kick":
+        if player_name not in admin_list:
+            send_message(client_socket, "&cYou do not have permission to use this command!")
+            return
+        if len(args) < 2:
+            send_message(client_socket, "&cUsage: /kick <player> [reason]")
+            return
+        target = args[1]
+        reason = ' '.join(args[2:]) if len(args) > 2 else "Kicked by operator"
+        target_socket = None
+        with clients_lock:
+            for sock, (name, pid) in clients.items():
+                if name.lower() == target.lower():
+                    target_socket = sock
+                    break
+
+        if target_socket:
+            print(f"[KICK] {player_name} kicked {target}: {reason}")
+            packet = struct.pack('>BB', 0x0d, 0xff)
+            packet += pad_string(f"&e{target} was kicked: {reason}")
+            broadcast(packet)
+            kick_player(target_socket, reason)
+        else:
+            send_message(client_socket, f"&cPlayer '{target}' not found")
+    elif command == "/register":
+        if len(args) < 2:
+            send_message(client_socket, "&cUsage: /register <password>")
+            return
+        users = load_users()
+        if player_name.lower() in users:
+            send_message(client_socket, "&cYou are already registered! Use /login.")
+            return
+        save_user(player_name, hash_password(args[1]))
+        authenticated_clients.add(client_socket)
+        send_message(client_socket, "&aRegistered and logged in successfully!")
+
+    elif command == "/login":
+        if len(args) < 2:
+            send_message(client_socket, "&cUsage: /login <password>")
+            return
+        users = load_users()
+        pw_hash = hash_password(args[1])
+        if users.get(player_name.lower()) == pw_hash:
+            authenticated_clients.add(client_socket)
+            send_message(client_socket, "&aLogged in! You can now move and speak.")
+        else:
+            send_message(client_socket, "&cInvalid password!")
+    else:
+        send_message("&cCommand not found!")
+        
 
 def send_message(client_socket, message):
     """Send a message to a specific client"""
@@ -84,298 +219,291 @@ def kick_player(target_socket, reason):
     except:
         pass
 
-def handle_command(client_socket, player_name, message):
-    """Handle player commands"""
-    parts = message.split()
-    command = parts[0].lower()
-    
-    if command == '/kick':
-        if len(parts) < 2:
-            send_message(client_socket, "&cUsage: /kick <player> [reason]")
-            return
-        
-        target_name = parts[1]
-        reason = ' '.join(parts[2:]) if len(parts) > 2 else "Kicked by operator"
-        
-        # Find target player
-        target_socket = None
-        with clients_lock:
-            for sock, (name, pid) in clients.items():
-                if name.lower() == target_name.lower():
-                    target_socket = sock
-                    break
-        
-        if target_socket:
-            print(f"[KICK] {player_name} kicked {target_name}: {reason}")
-            
-            # Notify everyone
-            packet = struct.pack('>BB', 0x0d, 0xff)
-            packet += pad_string(f"&e{target_name} was kicked: {reason}")
-            broadcast(packet)
-            
-            # Kick the player
-            kick_player(target_socket, reason)
-        else:
-            send_message(client_socket, f"&cPlayer '{target_name}' not found")
-    
-    elif command == '/tp':
-        if len(parts) < 2:
-            send_message(client_socket, "&cUsage: /tp <player> or /tp <x> <y> <z>")
-            return
-        
-        if len(parts) == 2:
-            # Teleport to another player
-            target_name = parts[1]
-            
-            # Find target player's position (we'd need to track positions for this)
-            # For now, just teleport to spawn
-            send_message(client_socket, f"&aTeleporting to {target_name}...")
-            teleport_player(client_socket, 64*32, 33*32, 64*32)
-        
-        elif len(parts) == 4:
-            # Teleport to coordinates
-            try:
-                x = int(float(parts[1]) * 32)  # Convert to fixed-point
-                y = int(float(parts[2]) * 32)
-                z = int(float(parts[3]) * 32)
-                
-                # Validate coordinates
-                if 0 <= x < X*32 and 0 <= y < Y*32 and 0 <= z < Z*32:
-                    send_message(client_socket, f"&aTeleporting to {x//32}, {y//32}, {z//32}...")
-                    teleport_player(client_socket, x, y, z)
-                    print(f"[TP] {player_name} teleported to ({x//32}, {y//32}, {z//32})")
-                else:
-                    send_message(client_socket, "&cCoordinates out of bounds!")
-            except ValueError:
-                send_message(client_socket, "&cInvalid coordinates!")
-        else:
-            send_message(client_socket, "&cUsage: /tp <player> or /tp <x> <y> <z>")
-    
-    elif command == '/help':
-        send_message(client_socket, "&eAvailable commands:")
-        send_message(client_socket, "&a/kick <player> [reason]")
-        send_message(client_socket, "&a/tp <player> or /tp <x> <y> <z>")
-        send_message(client_socket, "&a/help - Show this message")
-    
-    else:
-        send_message(client_socket, f"&cUnknown command: {command}")
-
 def handle_client(client_socket, address):
-    global next_player_id, world_data
-    
-    player_name = "Unknown"
+    global next_player_id
     player_id = -1
+    player_name = "Unknown"
     
     try:
-        print(f"[CONNECT] New connection from {address}")
+        print(f"[CONNECT] Connection from {address}")
         
-        # === HANDSHAKE (0x00) ===
-        # Client sends: [0x00][protocol_version][username*64][verify_key*64][unused]
+        # --- 1. Handshake & Identification ---
         handshake_id = recv_exact(client_socket, 1)[0]
         if handshake_id != 0x00:
-            print(f"[ERROR] Bad handshake ID: {handshake_id}")
+            print(f"[ERROR] Bad handshake: {handshake_id}")
             return
         
         protocol_version = recv_exact(client_socket, 1)[0]
         player_name = recv_exact(client_socket, 64).decode('ascii').strip()
         verify_key = recv_exact(client_socket, 64)
-        unused_byte = recv_exact(client_socket, 1)
+        unused = recv_exact(client_socket, 1)
         
-        print(f"[LOGIN] Player: {player_name}, Protocol: {protocol_version}")
+        print(f"[LOGIN] {player_name} (Protocol {protocol_version})")
         
         # Assign player ID
         with clients_lock:
             player_id = next_player_id
             next_player_id = (next_player_id + 1) % 128
-            if next_player_id == 255:  # Skip 255 (reserved for self)
+            if next_player_id == 255:  # Skip 255 (reserved)
                 next_player_id = 0
             clients[client_socket] = (player_name, player_id)
-        
-        # === SERVER IDENTIFICATION (0x00) ===
-        # [0x00][protocol_version][server_name*64][server_motd*64][user_type]
+
+        # Send Server Identification [0x00]
         packet = struct.pack('BB', 0x00, 0x07)
-        packet += pad_string("Classic Server")
-        packet += pad_string("Welcome!")
-        packet += struct.pack('B', 0x00)  # User type: normal
+        packet += pad_string("RLE Server")
+        packet += pad_string("Direct-Stream")
+        packet += struct.pack('B', 0x00)  # User type
         client_socket.sendall(packet)
         
-        # === LEVEL INITIALIZE (0x02) ===
-        client_socket.sendall(struct.pack('B', 0x02))
-        
-        # === LEVEL DATA (0x03) ===
-        # Compress world data
-        level_data = struct.pack('>I', len(world_data)) + world_data
-        compressed = io.BytesIO()
-        with gzip.GzipFile(fileobj=compressed, mode='wb') as gz:
-            gz.write(level_data)
-        compressed_data = compressed.getvalue()
-        
-        # Send in chunks
-        chunk_size = 1024
-        for i in range(0, len(compressed_data), chunk_size):
-            chunk = compressed_data[i:i+chunk_size]
-            percent = int((i + len(chunk)) * 100 / len(compressed_data))
+        # --- 2. Level Streaming (DIRECT - NO RAM EXPANSION) ---
+        client_socket.sendall(struct.pack('B', 0x02))  # Level Initialize
+
+        # Custom streamer that pipes RLE→Gzip→Socket without loading full world
+        class DirectSocketStreamer:
+            def __init__(self, sock):
+                self.sock = sock
+                self.sent = 0
+                self.total_size = X * Y * Z
             
-            # [0x03][chunk_length:short][chunk_data*1024][percent_complete]
-            packet = struct.pack('>BH', 0x03, len(chunk))
-            packet += chunk.ljust(1024, b'\x00')
-            packet += struct.pack('B', percent)
-            client_socket.sendall(packet)
+            def write(self, data):
+                # Send data in 1024-byte chunks
+                for i in range(0, len(data), 1024):
+                    chunk = data[i:i+1024]
+                    self.sent += len(chunk)
+                    percent = min(100, int((self.sent / self.total_size) * 100))
+                    
+                    # Packet 0x03: [ID][Length:short][Data*1024][Percent]
+                    packet = struct.pack('>BH', 0x03, len(chunk))
+                    packet += chunk.ljust(1024, b'\x00')
+                    packet += struct.pack('B', percent)
+                    self.sock.sendall(packet)
+
+        # Stream world directly from RLE file without expanding in RAM
+        streamer = DirectSocketStreamer(client_socket)
+        with gzip.GzipFile(fileobj=streamer, mode='wb', compresslevel=6) as gz:
+            # Write world size header
+            gz.write(struct.pack('>I', X * Y * Z))
+            
+            # Stream RLE data - expand on-the-fly
+            with open("world.rle", "rb") as f:
+                while True:
+                    pair = f.read(2)
+                    if not pair or len(pair) < 2:
+                        break
+                    count = pair[0]
+                    block_id = pair[1]
+                    # Expand this RLE pair directly into gzip stream
+                    gz.write(bytes([block_id]) * count)
         
-        # === LEVEL FINALIZE (0x04) ===
-        # [0x04][x:short][y:short][z:short]
+        # Level Finalize [0x04]
         packet = struct.pack('>Bhhh', 0x04, X, Y, Z)
         client_socket.sendall(packet)
         
-        # === SPAWN PLAYER (0x07) ===
-        # Spawn self (player_id = -1 for self)
-        spawn_x, spawn_y, spawn_z = 64 * 32, 33 * 32, 64 * 32
-        packet = struct.pack('>Bb', 0x07, -1)
-        packet += pad_string(player_name)
-        packet += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
-        client_socket.sendall(packet)
+        # --- 3. Player Spawning ---
+        # Classic protocol uses signed shorts (-32768 to 32767)
+        # For large worlds, spawn near origin instead of center
+        if (X // 2) * 32 > 32767 or (Z // 2) * 32 > 32767:
+            # Spawn at a safe location within protocol limits
+            spawn_x = 512 * 32  # Block 512
+            spawn_y = 70 * 32   # Block 70 (above ground)
+            spawn_z = 512 * 32  # Block 512
+        else:
+            # Normal spawn at world center
+            spawn_x = (X // 2) * 32
+            spawn_y = ((Y // 2) + 10) * 32
+            spawn_z = (Z // 2) * 32
         
-        # Spawn existing players for new player
+        # Tell ALL existing players about the new player FIRST
+        spawn_packet_others = struct.pack('>Bb', 0x07, player_id)
+        spawn_packet_others += pad_string(player_name)
+        spawn_packet_others += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
+        broadcast(spawn_packet_others, exclude=client_socket)
+        
+        # Tell new player about themselves
+        spawn_packet_self = struct.pack('>Bb', 0x07, -1)  # -1 = self
+        spawn_packet_self += pad_string(player_name)
+        spawn_packet_self += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
+        client_socket.sendall(spawn_packet_self)
+        
+        # Tell new player about all existing players
         with clients_lock:
             for sock, (name, pid) in clients.items():
                 if sock != client_socket:
-                    # Tell new player about existing player
-                    packet = struct.pack('>Bb', 0x07, pid)
-                    packet += pad_string(name)
-                    packet += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
-                    client_socket.sendall(packet)
-                    
-                    # Tell existing player about new player
-                    packet = struct.pack('>Bb', 0x07, player_id)
-                    packet += pad_string(player_name)
-                    packet += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
-                    try:
-                        sock.sendall(packet)
-                    except:
-                        pass
-                        
-        mpacket = struct.pack('>BB', 0x0d, 0xff)
-        mpacket += pad_string(f"&e{player_name} has joined the game")
-        broadcast(mpacket)
-        print(f"[SPAWN] {player_name} joined (ID: {player_id})")
+                    other_spawn = struct.pack('>Bb', 0x07, pid)
+                    other_spawn += pad_string(name)
+                    other_spawn += struct.pack('>hhhBB', spawn_x, spawn_y, spawn_z, 0, 0)
+                    client_socket.sendall(other_spawn)
         
-        # === MAIN GAME LOOP ===
+        # Join message
+        join_msg = struct.pack('>BB', 0x0d, 0xff)
+        join_msg += pad_string(f"&e{player_name} joined the game")
+        player_list.add(player_name)
+
+        broadcast(join_msg)
+        
+        print(f"[SPAWN] {player_name} spawned (ID: {player_id})")
+        
+        # --- 4. Main Packet Loop ---
+        move_packet_count = 0
+        blocks_placed = 0
+        last_check_time = time.time()
+        last_grief_time = time.time()
+        send_message(client_socket, "&ePlease /login <password> or /register <password>")
         while True:
             packet_id = recv_exact(client_socket, 1)[0]
+            VALID_PIDS = {0x00, 0x05, 0x08, 0x0d} 
+            is_auth = client_socket in authenticated_clients
+            if packet_id not in VALID_PIDS:
+                print(f"[SECURITY] Invalid packet ID 0x{packet_id:02x} from {player_name}. Blocking.")
+                kick_player(client_socket, "Invalid packet sequence detected.")
+                return
+
+            if time.time() - last_grief_time >= 1:
+                if blocks_placed > 45:
+                    print(f"[SECURITY] Triggered Anti Grief System")
+                    kick_player(client_socket, "Triggered Anti Grief. Slow down!")
+                    blocks_placed = 0
+                    last_grief_time = time.time()
+                blocks_placed = 0
+                last_check_time = time.time()
+
+            if time.time() - last_check_time >= 30:
+                #print(f"[NETWORK] {player_name} sent {move_packet_count} move packets in the last 30 seconds.")
+                if move_packet_count > (30*20)+(30*2):
+                    kick_player(client_socket, "Triggered Packet Spam")
+                move_packet_count = 0
+                last_check_time = time.time()
             
             if packet_id == 0x05:  # Set Block
-                # [0x05][x:short][y:short][z:short][mode:byte][block_type:byte]
                 x = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 y = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 z = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 mode = recv_exact(client_socket, 1)[0]
                 block_type = recv_exact(client_socket, 1)[0]
                 
+                
                 # Validate coordinates
                 if 0 <= x < X and 0 <= y < Y and 0 <= z < Z:
-                    index = (y * Z + z) * X + x
-                    world_data[index] = block_type if mode == 1 else 0
+                    idx = (y * Z + z) * X + x
+                    new_block = block_type if mode == 1 else 0
                     
-                    # Broadcast to all clients
-                    # [0x06][x:short][y:short][z:short][block_type:byte]
-                    packet = struct.pack('>BhhhB', 0x06, x, y, z, world_data[index])
-                    broadcast(packet)
+                    # Store in log
+                    with logs_lock: 
+                        block_logs[idx] = new_block
                     
-                    # Save world (async)
-                    threading.Thread(target=save_world, daemon=True).start()
+                    # Broadcast block change [0x06]
+                    blocks_placed += 1
+                    block_packet = struct.pack('>BhhhB', 0x06, x, y, z, new_block)
+                    broadcast(block_packet)
             
             elif packet_id == 0x08:  # Position & Orientation
-                # Client: [0x08][player_id:byte][x:short][y:short][z:short][yaw:byte][pitch:byte]
-                pid = recv_exact(client_socket, 1)[0]
+
+                move_packet_count +=1
+                pid = recv_exact(client_socket, 1)[0]  # Player's own ID (ignored)
                 x = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 y = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 z = struct.unpack('>h', recv_exact(client_socket, 2))[0]
                 yaw = recv_exact(client_socket, 1)[0]
                 pitch = recv_exact(client_socket, 1)[0]
                 
-                # Broadcast with server's player ID
-                # Server: [0x08][player_id:byte][x:short][y:short][z:short][yaw:byte][pitch:byte]
-                packet = struct.pack('>BbhhhBB', 0x08, player_id, x, y, z, yaw, pitch)
-                broadcast(packet, exclude_socket=client_socket)
+                if not is_auth:
+                    teleport_player(client_socket, spawn_x, spawn_y, spawn_z)
+                    continue
+                
+                # Broadcast position with SERVER's assigned player_id
+                move_packet = struct.pack('>BbhhhBB', 0x08, player_id, x, y, z, yaw, pitch)
+                broadcast(move_packet, exclude=client_socket)
             
             elif packet_id == 0x0d:  # Message
-                # [0x0d][player_id:byte][message*64]
                 pid = recv_exact(client_socket, 1)[0]
                 message = recv_exact(client_socket, 64).decode('ascii').strip()
+
+                if not is_auth and not (message.startswith('/login') or message.startswith('/register')):
+                    send_message(client_socket, "&cLogin to chat!")
+                    continue
                 
                 if message:
-                    # Check for commands
                     if message.startswith('/'):
-                        handle_command(client_socket, player_name, message)
+                        print(f"[COMMAND] <{player_name}> <{message}>")
+                        handle_command(player_name, message, client_socket)
                     else:
                         print(f"[CHAT] <{player_name}> {message}")
-                        
-                        # Broadcast to all
-                        # [0x0d][player_id:byte][message*64]
-                        packet = struct.pack('>BB', 0x0d, 0xff)  # 0xff = system message
-                        packet += pad_string(f"&f<{player_name}> {message}")
-                        broadcast(packet)
+                        chat_packet = struct.pack('>BB', 0x0d, 0xff)
+                        chat_packet += pad_string(f"&f<{player_name}> {message}")
+                        broadcast(chat_packet)
             
             else:
-                print(f"[WARN] Unknown packet: 0x{packet_id:02x} from {player_name}")
-    
+                print(f"[WARN] Unknown packet 0x{packet_id:02x} from {player_name}")
+
     except ConnectionError:
-        print(f"[DISCONNECT] {player_name} lost connection")
+        print(f"[DISCONNECT] {player_name} connection lost")
     except Exception as e:
         print(f"[ERROR] {player_name}: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        # Clean up
+        # Cleanup
         with clients_lock:
             if client_socket in clients:
                 del clients[client_socket]
         
-        # Notify others of disconnect
-        # [0x0c][player_id:byte]
+        # Despawn player
         if player_id >= 0:
-            packet = struct.pack('>Bb', 0x0c, player_id)
-            broadcast(packet)
-            mpacket = struct.pack('>BB', 0x0d, 0xff)
-            mpacket += pad_string(f"&e{player_name} has left the game")
-            broadcast(mpacket)
-            print(f"[LEAVE] {player_name} left the game")
+            despawn_packet = struct.pack('>Bb', 0x0c, player_id)
+            broadcast(despawn_packet)
+            
+            leave_msg = struct.pack('>BB', 0x0d, 0xff)
+            leave_msg += pad_string(f"&e{player_name} left the game")
+            broadcast(leave_msg)
+
+            player_list.remove(player_name)
+            
+            print(f"[LEAVE] {player_name} left")
         
         try:
             client_socket.close()
         except:
             pass
 
+def broadcast(packet, exclude=None):
+    """Send packet to all clients except excluded one"""
+    with clients_lock:
+        dead_sockets = []
+        for sock in list(clients.keys()):
+            if sock != exclude:
+                try:
+                    sock.sendall(packet)
+                except:
+                    dead_sockets.append(sock)
+        
+        # Clean up dead connections
+        for sock in dead_sockets:
+            if sock in clients:
+                del clients[sock]
+
 def main():
-    global world_data
+    generate_initial_rle()
     
-    # Load or create world
-    if os.path.exists("world.dat"):
-        try:
-            with lzma.open("world.dat", "rb") as f:
-                world_data = bytearray(f.read())
-            print(f"[SERVER] Loaded world ({len(world_data)} bytes)")
-        except Exception as e:
-            print(f"[ERROR] Failed to load world: {e}")
-            print("[SERVER] Generating new world...")
-            world_data = bytearray(X * Y * Z)
-            # Fill bottom half with grass
-            for i in range(len(world_data) // 2):
-                world_data[i] = 2
-            save_world()
-    else:
-        print("[SERVER] Generating new world...")
-        world_data = bytearray(X * Y * Z)
-        for i in range(len(world_data) // 2):
-            world_data[i] = 2
-        save_world()
-    
+    # Start auto-save thread
+    threading.Thread(target=auto_save_task, daemon=True).start()
+    print("[SERVER] Auto-save enabled (every 5 minutes)")
+
+    try:
+        tunnel = ngrok.connect(25565, "tcp")
+        print(f"[NGROK] Tunnel established: {tunnel.public_url}")
+        
+    except Exception as e:
+        print(f"[NGROK ERROR] {e}")
+
     # Start server
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('0.0.0.0', 25565))
     server.listen(5)
     
-    print("[SERVER] Minecraft Classic 0.30 Server")
-    print("[SERVER] Listening on port 25565...")
+    print(f"[SERVER] RLE Log Server Running")
+    print(f"[SERVER] World: {X}x{Y}x{Z} = {X*Y*Z:,} blocks")
+    print(f"[SERVER] Listening on port 25565...")
     
     try:
         while True:
@@ -384,7 +512,71 @@ def main():
             thread.start()
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down...")
-        save_world()
+        if not block_logs: pass
+        
+        print(f"[SERVER] Fast-saving {len(block_logs)} changes in 50MB chunks...")
+        try:
+            with logs_lock:
+                changes_copy = dict(block_logs)
+            
+            CHUNK_SIZE = 50_000_000 
+            new_rle_path = "world.rle.tmp"
+            
+            with open("world.rle", "rb") as f_in, open(new_rle_path, "wb") as f_out:
+                # Read all existing RLE metadata at once (this is small)
+                rle_data = f_in.read()
+                counts = np.frombuffer(rle_data[0::2], dtype=np.uint8)
+                vals = np.frombuffer(rle_data[1::2], dtype=np.uint8)
+                
+                # Reconstruct only the indices we need to find chunk boundaries
+                # Note: We don't reconstruct the world, just the "cumulative" counts
+                cum_counts = np.cumsum(counts, dtype=np.int64)
+                
+                for start in range(0, X*Y*Z, CHUNK_SIZE):
+                    end = min(start + CHUNK_SIZE, X*Y*Z)
+                    
+                    # Find which RLE pairs belong to this 100MB chunk
+                    # This is the "secret sauce" for speed
+                    idx_start = np.searchsorted(cum_counts, start, side='right')
+                    idx_end = np.searchsorted(cum_counts, end, side='left')
+                    
+                    # Materialize just THIS 100MB chunk
+                    chunk_counts = counts[idx_start:idx_end+1].copy()
+                    chunk_vals = vals[idx_start:idx_end+1].copy()
+                    
+                    # Adjust the first and last run if they overlap chunk boundaries
+                    chunk_counts[0] = cum_counts[idx_start] - start
+                    chunk_counts[-1] = end - (cum_counts[idx_end-1] if idx_end > 0 else 0)
+                    
+                    # Expand, patch, and re-compress the chunk using NumPy
+                    temp_chunk = np.repeat(chunk_vals, chunk_counts)
+                    
+                    # Patch logs
+                    for idx in list(changes_copy.keys()):
+                        if start <= idx < end:
+                            temp_chunk[idx - start] = changes_copy.pop(idx)
+                    
+                    # Fast RLE compression for the chunk
+                    if len(temp_chunk) > 0:
+                        diffs = np.concatenate(([True], temp_chunk[1:] != temp_chunk[:-1]))
+                        points = np.where(diffs)[0]
+                        run_vals = temp_chunk[points]
+                        run_lens = np.diff(np.append(points, len(temp_chunk)))
+                        
+                        for c, v in zip(run_lens, run_vals):
+                            while c > 255:
+                                f_out.write(bytes([255, int(v)]))
+                                c -= 255
+                            f_out.write(bytes([int(c), int(v)]))
+
+            os.replace(new_rle_path, "world.rle")
+            with logs_lock:
+                for key in (set(block_logs.keys()) - set(changes_copy.keys())):
+                    block_logs.pop(key, None)
+            print("[SERVER] Fast-save complete.")
+        except Exception as e:
+            print(f"[ERROR] Save failed: {e}")
+        
         server.close()
 
 if __name__ == "__main__":
